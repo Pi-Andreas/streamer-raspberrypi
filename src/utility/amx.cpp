@@ -19,7 +19,68 @@
 #include "amx.h"
 #include "../core.h"
 
+#include <cstdint>
+#include <cstring>
+
 using namespace Utility;
+
+namespace
+{
+	// A 64-bit open.mp server stores native pointers full width over the
+	// whole AMX_FUNCSTUBNT entry (address and name offset), so registered
+	// natives no longer carry a usable name offset or a 32-bit address.
+	constexpr bool wideNatives = sizeof(AMX_NATIVE) > sizeof(ucell);
+
+	// Name of native `index`. With wide natives the name offset may be
+	// overwritten, so walk the name table instead (names are stored in table
+	// order, natives right after publics), as open.mp itself does.
+	const char *nativeName(AMX *amx, int index)
+	{
+		AMX_HEADER *amxHeader = reinterpret_cast<AMX_HEADER*>(amx->base);
+		if (!wideNatives)
+		{
+			AMX_FUNCSTUBNT *amxNativeTable = reinterpret_cast<AMX_FUNCSTUBNT*>(amx->base + amxHeader->natives);
+			return reinterpret_cast<char*>(amx->base + amxNativeTable[index].nameofs);
+		}
+		int numberOfPublics = (amxHeader->natives - amxHeader->publics) / amxHeader->defsize;
+		const char *name = reinterpret_cast<char*>(amx->base + amxHeader->nametable);
+		if (numberOfPublics > 0)
+		{
+			AMX_FUNCSTUBNT *amxPublicTable = reinterpret_cast<AMX_FUNCSTUBNT*>(amx->base + amxHeader->publics);
+			name = reinterpret_cast<char*>(amx->base + amxPublicTable[numberOfPublics - 1].nameofs);
+			name += std::strlen(name) + 1;
+		}
+		while (index-- > 0)
+		{
+			name += std::strlen(name) + 1;
+		}
+		return name;
+	}
+
+	bool nativeRegistered(const AMX_FUNCSTUBNT &entry)
+	{
+		if (wideNatives)
+		{
+			uintptr_t address = 0;
+			std::memcpy(&address, &entry, sizeof(address));
+			return address != 0;
+		}
+		return entry.address != 0;
+	}
+
+	void setNative(AMX_FUNCSTUBNT &entry, AMX_NATIVE function)
+	{
+		if (wideNatives)
+		{
+			uintptr_t address = reinterpret_cast<uintptr_t>(function);
+			std::memcpy(&entry, &address, sizeof(address));
+		}
+		else
+		{
+			entry.address = static_cast<ucell>(reinterpret_cast<uintptr_t>(function));
+		}
+	}
+}
 
 cell AMX_NATIVE_CALL Utility::hookedNative(AMX *amx, cell *params)
 {
@@ -37,13 +98,13 @@ int Utility::checkInterfaceAndRegisterNatives(AMX *amx, AMX_NATIVE_INFO *amxNati
 	amx_NumNatives(amx, &numberOfNatives);
 	for (int i = 0; i < numberOfNatives; ++i)
 	{
-		char *name = reinterpret_cast<char*>(amx->base + amxNativeTable[i].nameofs);
+		const char *name = nativeName(amx, i);
 		if (std::string(name).find("Streamer_") != std::string::npos)
 		{
 			foundNatives = true;
-			if (!amxNativeTable[i].address)
+			if (!nativeRegistered(amxNativeTable[i]))
 			{
-				amxNativeTable[i].address = reinterpret_cast<cell>(hookedNative);
+				setNative(amxNativeTable[i], hookedNative);
 				hookedNatives = true;
 			}
 		}
