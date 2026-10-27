@@ -291,3 +291,6 @@ __pycache__/
 *.amx
 *.i
 .vscode/
+# Raspberry Pi build
+build-raspberrypi/
+raspberrypi/dist/
