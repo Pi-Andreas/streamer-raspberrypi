@@ -747,6 +747,191 @@ void sampgdk_do_vlogprintf(const char *format, va_list va) {
 /* #include "hook.h" */
 /* #include "types.h" */
 
+#if defined __aarch64__
+
+/*
+ * AArch64 hooks.
+ *
+ * The first four instructions (16 bytes) of the target function are replaced
+ * with an absolute jump to the hook:
+ *
+ *   ldr x17, #8 ; br x17 ; .quad dst
+ *
+ * x17 (IP1) is the intra-procedure-call scratch register, free to clobber at
+ * a function entry. The four original instructions move to an executable
+ * trampoline, followed by the same kind of jump back to src + 16, so calling
+ * the trampoline runs the original function. PC-relative instructions are
+ * rewritten to absolute form; a PC-relative load is refused and makes
+ * sampgdk_hook_new fail rather than run mis-copied code.
+ *
+ * open.mp keeps the hooked AMX functions as optnone pass-through wrappers
+ * (Server/Components/Pawn/Script/Script.cpp) so their prologues are plain
+ * stack set-up, at least 16 bytes long.
+ */
+
+#define _SAMPGDK_HOOK_INSNS 4
+
+struct _sampgdk_hook {
+  uint32_t *src;
+  uint32_t *trampoline;
+  uint32_t orig[_SAMPGDK_HOOK_INSNS];
+};
+
+static int _sampgdk_hook_unprotect(void *address, size_t size) {
+  uintptr_t pagesize = (uintptr_t)sysconf(_SC_PAGESIZE);
+  uintptr_t start = (uintptr_t)address & ~(pagesize - 1);
+  uintptr_t end = (uintptr_t)address + size;
+
+  return mprotect((void *)start, end - start,
+                  PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
+/* ldr x17, #8 ; br x17 ; .quad target */
+static uint32_t *_sampgdk_hook_emit_jump(uint32_t *out, uint64_t target) {
+  *out++ = 0x58000051;
+  *out++ = 0xd61f0220;
+  memcpy(out, &target, sizeof(target));
+  return out + 2;
+}
+
+static int64_t _sampgdk_hook_sext(uint64_t value, int bits) {
+  uint64_t sign = 1ULL << (bits - 1);
+
+  value &= (1ULL << bits) - 1;
+  return (int64_t)((value ^ sign) - sign);
+}
+
+/* Writes insn, originally at pc, to out with PC-relative operands made
+ * absolute. Returns the new end of out, or NULL if insn can't be moved.
+ */
+static uint32_t *_sampgdk_hook_relocate(uint32_t *out, uint32_t insn,
+                                        uint64_t pc) {
+  if ((insn & 0x1f000000) == 0x10000000) {
+    /* adr / adrp xd, label -> ldr xd, #8 ; b #12 ; .quad address */
+    uint64_t imm = ((insn >> 29) & 3) | (((insn >> 5) & 0x7ffff) << 2);
+    uint64_t address;
+
+    if (insn & 0x80000000) {
+      address = (pc & ~0xfffULL) +
+                (uint64_t)(_sampgdk_hook_sext(imm, 21) * 4096);
+    } else {
+      address = pc + (uint64_t)_sampgdk_hook_sext(imm, 21);
+    }
+    *out++ = 0x58000040 | (insn & 0x1f);
+    *out++ = 0x14000003;
+    memcpy(out, &address, sizeof(address));
+    return out + 2;
+  }
+
+  if ((insn & 0x7c000000) == 0x14000000) {
+    /* b / bl label */
+    uint64_t target = pc + (uint64_t)(_sampgdk_hook_sext(insn & 0x3ffffff, 26) * 4);
+
+    if (insn & 0x80000000) {
+      /* bl: ldr x17, #12 ; blr x17 ; b #12 ; .quad target */
+      *out++ = 0x58000071;
+      *out++ = 0xd63f0220;
+      *out++ = 0x14000003;
+      memcpy(out, &target, sizeof(target));
+      return out + 2;
+    }
+    return _sampgdk_hook_emit_jump(out, target);
+  }
+
+  if ((insn & 0xff000010) == 0x54000000 ||  /* b.cond */
+      (insn & 0x7e000000) == 0x34000000 ||  /* cbz / cbnz */
+      (insn & 0x7e000000) == 0x36000000) {  /* tbz / tbnz */
+    int bits = (insn & 0x7e000000) == 0x36000000 ? 14 : 19;
+    uint32_t mask = ((1u << bits) - 1) << 5;
+    uint64_t target = pc +
+      (uint64_t)(_sampgdk_hook_sext((insn & mask) >> 5, bits) * 4);
+
+    /* The same test, branching to a jump stub:
+     *   <cond> #8 ; b #20 ; ldr x17, #8 ; br x17 ; .quad target
+     */
+    *out++ = (insn & ~mask) | (2u << 5);
+    *out++ = 0x14000005;
+    return _sampgdk_hook_emit_jump(out, target);
+  }
+
+  if ((insn & 0x3b000000) == 0x18000000) {
+    return NULL; /* ldr (literal): PC-relative load */
+  }
+
+  *out++ = insn;
+  return out;
+}
+
+sampgdk_hook_t sampgdk_hook_new(void *src, void *dst) {
+  size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+  struct _sampgdk_hook *hook;
+  uint32_t *out;
+  void *page;
+  int i;
+
+  if ((hook = (sampgdk_hook_t)malloc(sizeof(*hook))) == NULL) {
+    return NULL;
+  }
+
+  page = mmap(NULL, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == MAP_FAILED) {
+    free(hook);
+    return NULL;
+  }
+
+  hook->src = (uint32_t *)src;
+  hook->trampoline = (uint32_t *)page;
+  memcpy(hook->orig, src, sizeof(hook->orig));
+
+  out = hook->trampoline;
+  for (i = 0; i < _SAMPGDK_HOOK_INSNS; i++) {
+    out = _sampgdk_hook_relocate(out, hook->orig[i],
+                                 (uint64_t)(uintptr_t)(hook->src + i));
+    if (out == NULL) {
+      sampgdk_log_error("Unsupported instruction %08x at %p",
+                        hook->orig[i], (void *)(hook->src + i));
+      munmap(page, pagesize);
+      free(hook);
+      return NULL;
+    }
+  }
+  _sampgdk_hook_emit_jump(out,
+                          (uint64_t)(uintptr_t)(hook->src + _SAMPGDK_HOOK_INSNS));
+  __builtin___clear_cache((char *)page, (char *)page + pagesize);
+
+  if (_sampgdk_hook_unprotect(src, sizeof(hook->orig)) != 0) {
+    munmap(page, pagesize);
+    free(hook);
+    return NULL;
+  }
+  _sampgdk_hook_emit_jump(hook->src, (uint64_t)(uintptr_t)dst);
+  __builtin___clear_cache((char *)src, (char *)src + sizeof(hook->orig));
+
+  return hook;
+}
+
+void sampgdk_hook_free(sampgdk_hook_t hook) {
+  if (hook == NULL) {
+    return;
+  }
+
+  /* Put the original instructions back so the server never jumps into a
+   * hook that is about to be unloaded with the plugin.
+   */
+  memcpy(hook->src, hook->orig, sizeof(hook->orig));
+  __builtin___clear_cache((char *)hook->src,
+                          (char *)hook->src + sizeof(hook->orig));
+  munmap(hook->trampoline, (size_t)sysconf(_SC_PAGESIZE));
+  free(hook);
+}
+
+void *sampgdk_hook_trampoline(sampgdk_hook_t hook) {
+  return hook->trampoline;
+}
+
+#else /* x86 */
+
 #define _SAMPGDK_HOOK_JMP_SIZE 5
 #define _SAMPGDK_HOOK_MAX_INSN_LEN 15
 #define _SAMPGDK_HOOK_TRAMPOLINE_SIZE \
@@ -974,6 +1159,8 @@ void sampgdk_hook_free(sampgdk_hook_t hook) {
 void *sampgdk_hook_trampoline(sampgdk_hook_t hook) {
   return hook->trampoline;
 }
+
+#endif /* __aarch64__ */
 
 #include <assert.h>
 #include <errno.h>
@@ -2663,7 +2850,15 @@ static int AMXAPI _sampgdk_amxhooks_Register(AMX *amx,
   natives = (AMX_FUNCSTUBNT *)(amx->base + hdr->natives);
 
   if (amx_FindNative(amx, "funcidx", &i) == AMX_ERR_NONE) {
+#if defined __aarch64__
+    /* A 64-bit open.mp server stores native pointers full width over the
+     * table entry (address and name offset); a ucell would truncate it.
+     */
+    uintptr_t address = (uintptr_t)_sampgdk_amxhooks_funcidx;
+    memcpy(&natives[i], &address, sizeof(address));
+#else
     natives[i].address = (ucell)_sampgdk_amxhooks_funcidx;
+#endif
   }
 
   for (i = 0; (i < number || number == -1) && nativelist[i].name != NULL; i++) {
